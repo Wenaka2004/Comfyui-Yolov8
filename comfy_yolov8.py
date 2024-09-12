@@ -4,6 +4,7 @@ import numpy as np
 from ultralytics import YOLO
 import torch
 import os
+import ast
 
 folder_paths.folder_names_and_paths["yolov8"] = ([os.path.join(folder_paths.models_dir, "yolov8")], folder_paths.supported_pt_extensions)
 
@@ -25,22 +26,18 @@ class Yolov8DetectionNode:
     CATEGORY = "yolov8"
 
     def detect(self, image, model_name):
-        # Convert tensor to numpy array and then to PIL Image
         image_tensor = image
-        image_np = image_tensor.cpu().numpy()  # Change from CxHxW to HxWxC for Pillow
-        image = Image.fromarray((image_np.squeeze(0) * 255).astype(np.uint8))  # Convert float [0,1] tensor to uint8 image
+        image_np = image_tensor.cpu().numpy()
+        image = Image.fromarray((image_np.squeeze(0) * 255).astype(np.uint8))
         
         print(f'model_path: {os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')
-        model = YOLO(f'{os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')  # load a custom model
+        model = YOLO(f'{os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')
         results = model(image)
 
-        # TODO load masks
-        # masks = results[0].masks
+        im_array = results[0].plot()
+        im = Image.fromarray(im_array[...,::-1])
 
-        im_array = results[0].plot()  # plot a BGR numpy array of predictions
-        im = Image.fromarray(im_array[...,::-1])  # RGB PIL image
-
-        image_tensor_out = torch.tensor(np.array(im).astype(np.float32) / 255.0)  # Convert back to CxHxW
+        image_tensor_out = torch.tensor(np.array(im).astype(np.float32) / 255.0)
         image_tensor_out = torch.unsqueeze(image_tensor_out, 0)
 
         return (image_tensor_out, {"classify": [r.boxes.cls.tolist()[0] for r in results]})
@@ -55,7 +52,7 @@ class Yolov8SegNode:
             "required": {
                 "image": ("IMAGE",), 
                 "model_name": (folder_paths.get_filename_list("yolov8"), ),
-                "class_id": ("INT", {"default": 0})
+                "class_ids_text": ("STRING", {"default": "[0]"})
             },
         }
 
@@ -63,36 +60,44 @@ class Yolov8SegNode:
     FUNCTION = "seg"
     CATEGORY = "yolov8"
 
-    def seg(self, image, model_name, class_id):
-        # Convert tensor to numpy array and then to PIL Image
+    def seg(self, image, model_name, class_ids_text):
+        try:
+            class_ids = ast.literal_eval(class_ids_text)
+            if not isinstance(class_ids, list):
+                raise ValueError("Input must be a list of integers.")
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Invalid input for class_ids: {class_ids_text}. Must be a list of integers, e.g., '[0, 1, 2]'. Error: {e}")
+
         image_tensor = image
-        image_np = image_tensor.cpu().numpy()  # Change from CxHxW to HxWxC for Pillow
-        image = Image.fromarray((image_np.squeeze(0) * 255).astype(np.uint8))  # Convert float [0,1] tensor to uint8 image
+        image_np = image_tensor.cpu().numpy()
+        image = Image.fromarray((image_np.squeeze(0) * 255).astype(np.uint8))
         
         print(f'model_path: {os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')
-        model = YOLO(f'{os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')  # load a custom model
+        model = YOLO(f'{os.path.join(folder_paths.models_dir, "yolov8")}/{model_name}')
         results = model(image)
 
+        if results[0].masks is None:
+            print("No masks found, returning empty mask.")
+            combined_mask = torch.zeros(image_tensor.shape[2:], dtype=torch.int) * 255
+        else:
+            masks = results[0].masks.data
+            boxes = results[0].boxes.data
+            clss = boxes[:, 5]
+            combined_mask = torch.zeros_like(masks[0], dtype=torch.int)
+            for class_id in class_ids:
+                indices = torch.where(clss == class_id)
+                if indices[0].numel() > 0:
+                    combined_mask = combined_mask | torch.any(masks[indices], dim=0).int()
 
-        # get array results
-        masks = results[0].masks.data
-        boxes = results[0].boxes.data
-        # extract classes
-        clss = boxes[:, 5]
-        # get indices of results where class is 0 (people in COCO)
-        people_indices = torch.where(clss == class_id)
-        # use these indices to extract the relevant masks
-        people_masks = masks[people_indices]
-        # scale for visualizing results
-        people_mask = torch.any(people_masks, dim=0).int() * 255
+            combined_mask = combined_mask * 255
 
-        im_array = results[0].plot()  # plot a BGR numpy array of predictions
-        im = Image.fromarray(im_array[...,::-1])  # RGB PIL image
+        im_array = results[0].plot()
+        im = Image.fromarray(im_array[...,::-1])
 
-        image_tensor_out = torch.tensor(np.array(im).astype(np.float32) / 255.0)  # Convert back to CxHxW
+        image_tensor_out = torch.tensor(np.array(im).astype(np.float32) / 255.0)
         image_tensor_out = torch.unsqueeze(image_tensor_out, 0)
 
-        return (image_tensor_out, people_mask)
+        return (image_tensor_out, combined_mask)
 
 NODE_CLASS_MAPPINGS = {
     "Yolov8Detection": Yolov8DetectionNode,
@@ -103,4 +108,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Yolov8Detection": "detection",
     "Yolov8Segmentation": "seg",
 }
-
